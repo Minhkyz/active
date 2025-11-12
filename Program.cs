@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
@@ -20,10 +21,11 @@ namespace MarbleRaceWebSocketBot
         private readonly int _baseStake;
         private readonly string _discordWebhookUrl = "";
 
-        private readonly Dictionary<string, int> _realStake = new();
         private readonly HashSet<string> _chosenThisRound = new();
         private readonly List<SimulationTracker> _simulations;
         private readonly HashSet<SimulationTracker> _activeLiveSignals = new();
+        private readonly Dictionary<string, int> _lastLiveBet = new();
+        private readonly WebMonitor? _monitor;
 
         private static int _msgSeq;
 
@@ -46,31 +48,36 @@ namespace MarbleRaceWebSocketBot
 
         private static string NextMsgId(string pfx) => $"{pfx}-{Interlocked.Increment(ref _msgSeq)}";
 
-        private static readonly string[] AllSpots =
+        internal static readonly string[] AllSpots =
         {
             "Marble_1", "Marble_2", "Marble_3", "Marble_4", "Marble_5", "Marble_6"
         };
 
-        public MarbleRaceClient(int baseStake = 10, string discordWebhookUrl = "")
+        public MarbleRaceClient(int baseStake = 10, string discordWebhookUrl = "", WebMonitor? monitor = null)
         {
             _baseStake = baseStake <= 0 ? 10 : baseStake;
             _discordWebhookUrl = discordWebhookUrl?.Trim() ?? string.Empty;
-
-            foreach (var spot in AllSpots)
-            {
-                _realStake[spot] = _baseStake;
-            }
+            _monitor = monitor;
 
             _simulations = Enumerable.Range(0, 10)
-                .Select(i => new SimulationTracker($"Sim{i + 1}", AllSpots, i))
+                .Select(i => new SimulationTracker($"Sim{i + 1}", AllSpots, i, _baseStake, MaxStakePerSpot, EscalateFactor))
                 .ToList();
+
+            if (_monitor != null)
+            {
+                foreach (var sim in _simulations)
+                {
+                    _monitor.RegisterSimulation(sim.Name);
+                }
+            }
         }
 
         private void ResetAllToBase()
         {
-            foreach (var s in AllSpots)
+            _lastLiveBet.Clear();
+            foreach (var sim in _simulations)
             {
-                _realStake[s] = _baseStake;
+                sim.ResetToBase();
             }
             _winStreak = 0;
         }
@@ -493,27 +500,20 @@ namespace MarbleRaceWebSocketBot
                 Console.ResetColor();
 
                 _realWins++;
+                var stakeSnapshot = FormatStakeSnapshot(_lastLiveBet);
                 await PostDiscordEmbedAsync(
                     title: "Marble — WIN",
                     desc: $"**Round:** `{_currentNumber}` (`{_currentGameId}`)\n**WinStreak:** `{_winStreak}` • **Wins(total):** `{_realWins}`",
                     kind: "WIN",
                     fields: new[]
                     {
-                        ("Stakes now", $"1:{_realStake["Marble_1"]} 2:{_realStake["Marble_2"]} 3:{_realStake["Marble_3"]} 4:{_realStake["Marble_4"]} 5:{_realStake["Marble_5"]} 6:{_realStake["Marble_6"]}", false),
+                        ("Stake snapshot", $"`{stakeSnapshot}`", false),
                         ("Balance", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance, 2)}`", true),
                         ("P/L Total", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance - _firstBalance, 2)}`", true),
                         ("Total sum LIVE", $"`{_sumTotalLive:N0}`", true)
                     }
                 );
 
-                ResetAllToBase();
-                foreach (var sim in _activeLiveSignals)
-                {
-                    sim.ResetAfterLiveWin();
-                }
-
-                _activeLiveSignals.Clear();
-                _isLiveBetting = false;
             }
             else
             {
@@ -523,45 +523,46 @@ namespace MarbleRaceWebSocketBot
                 Console.WriteLine($" - LOSS. Number={_currentNumber} GameId={_currentGameId}");
                 Console.ResetColor();
 
-                var exceeded = false;
-                foreach (var s in _chosenThisRound)
-                {
-                    var next = (int)Math.Ceiling(_realStake[s] * EscalateFactor);
-                    if (next > MaxStakePerSpot) exceeded = true;
-                    _realStake[s] = Math.Min(next, MaxStakePerSpot);
-                }
+                var stakeSnapshot = FormatStakeSnapshot(_lastLiveBet);
+                await PostDiscordEmbedAsync(
+                    title: "Marble — LOSS",
+                    desc: $"**Round:** `{_currentNumber}` (`{_currentGameId}`)",
+                    kind: "LOSS",
+                    fields: new[]
+                    {
+                        ("Stake snapshot", $"`{stakeSnapshot}`", false),
+                        ("Balance", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance, 2)}`", true),
+                        ("P/L Total", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance - _firstBalance, 2)}`", true),
+                        ("Total sum LIVE", $"`{_sumTotalLive:N0}`", true)
+                    }
+                );
 
-                if (exceeded)
-                {
-                    ResetAllToBase();
-                    await NotifyResetAsync($"Stake exceeded MaxStakePerSpot ({MaxStakePerSpot})");
-                    foreach (var sim in _activeLiveSignals) sim.ResetAfterLiveWin();
-                    _activeLiveSignals.Clear();
-                    _isLiveBetting = false;
-                }
-                else
-                {
-                    await PostDiscordEmbedAsync(
-                        title: "Marble — LOSS",
-                        desc: $"**Round:** `{_currentNumber}` (`{_currentGameId}`)",
-                        kind: "LOSS",
-                        fields: new[]
-                        {
-                            ("Escalated", string.Join(", ", _chosenThisRound.Select(s => $"{s}={_realStake[s]}")), false),
-                            ("Balance", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance, 2)}`", true),
-                            ("P/L Total", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance - _firstBalance, 2)}`", true),
-                            ("Total sum LIVE", $"`{_sumTotalLive:N0}`", true)
-                        }
-                    );
-                }
             }
 
             _hasPlacedForThisRound = false;
             _chosenThisRound.Clear();
 
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($" - Stakes now: 1:{_realStake["Marble_1"]} 2:{_realStake["Marble_2"]} 3:{_realStake["Marble_3"]} 4:{_realStake["Marble_4"]} 5:{_realStake["Marble_5"]} 6:{_realStake["Marble_6"]}");
+            Console.WriteLine(" - Simulation stakes snapshot:");
+            foreach (var sim in _simulations.OrderBy(s => s.Name))
+            {
+                Console.WriteLine($"   {sim.Name}: Stake={sim.CurrentStakePerSpot} | Losses={sim.ConsecutiveLosses} | Zero={sim.ZeroSpot}");
+            }
             Console.ResetColor();
+
+            var reachedCap = _activeLiveSignals.Any(sim => sim.CurrentStakePerSpot >= MaxStakePerSpot);
+            if (reachedCap)
+            {
+                await NotifyResetAsync($"Simulation stake reached MaxStakePerSpot ({MaxStakePerSpot})");
+                ResetAllToBase();
+                _activeLiveSignals.Clear();
+                _isLiveBetting = false;
+            }
+
+            if (_activeLiveSignals.Count == 0)
+            {
+                _isLiveBetting = false;
+            }
         }
 
         private void RunSimulationsForRound()
@@ -569,11 +570,14 @@ namespace MarbleRaceWebSocketBot
             long roundTotal = 0;
             foreach (var sim in _simulations)
             {
-                sim.PrepareRound(_baseStake);
+                var snapshot = sim.PrepareRound(_currentGameId, _currentNumber);
                 roundTotal += sim.TotalStakeThisRound;
 
+                _monitor?.RecordPrediction(snapshot);
+
                 Console.ForegroundColor = ConsoleColor.DarkCyan;
-                Console.WriteLine($"[SIM-{sim.Name}] Picks: {string.Join(",", sim.CurrentPicks)} | Zero: {sim.ZeroSpot} | LossStreak={sim.ConsecutiveLosses}");
+                Console.WriteLine(
+                    $"[SIM-{sim.Name}] Stake={sim.CurrentStakePerSpot} | LossStreak={sim.ConsecutiveLosses} | Zero: {sim.ZeroSpot} | Picks: {string.Join(",", snapshot.Picks)}");
                 Console.ResetColor();
             }
 
@@ -585,16 +589,26 @@ namespace MarbleRaceWebSocketBot
 
         private async Task PlaceLiveBetAsync(ClientWebSocket ws, string gameId, CancellationToken ct)
         {
-            var scores = new Dictionary<string, int>();
+            var aggregated = new Dictionary<string, int>();
             foreach (var sim in _activeLiveSignals)
             {
-                foreach (var spot in sim.CurrentPicks)
+                foreach (var kv in sim.CurrentProposedStakes)
                 {
-                    scores[spot] = scores.TryGetValue(spot, out var current) ? current + 1 : 1;
+                    aggregated[kv.Key] = aggregated.TryGetValue(kv.Key, out var current)
+                        ? current + kv.Value
+                        : kv.Value;
                 }
             }
 
-            var ordered = scores
+            if (aggregated.Count == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.WriteLine(" - No aggregated stakes available for live bet.");
+                Console.ResetColor();
+                return;
+            }
+
+            var ordered = aggregated
                 .OrderByDescending(kv => kv.Value)
                 .ThenBy(kv => kv.Key)
                 .Select(kv => kv.Key)
@@ -612,18 +626,59 @@ namespace MarbleRaceWebSocketBot
             var selected = ordered.Take(5).ToList();
             var zeroSpot = AllSpots.First(spot => !selected.Contains(spot));
 
-            _chosenThisRound.Clear();
-            foreach (var spot in selected) _chosenThisRound.Add(spot);
+            var selectedAmounts = selected.ToDictionary(
+                spot => spot,
+                spot => aggregated.TryGetValue(spot, out var value) ? value : 0);
+
+            var minStake = selectedAmounts.Values.DefaultIfEmpty(0).Min();
+            if (minStake > 0 && selectedAmounts.Values.Any(v => v > minStake))
+            {
+                foreach (var spot in selected)
+                {
+                    selectedAmounts[spot] = Math.Max(0, selectedAmounts[spot] - minStake);
+                }
+            }
 
             var chips = new Dictionary<string, int>();
             var total = 0;
+            var capped = false;
+
+            _chosenThisRound.Clear();
+            _lastLiveBet.Clear();
+
+            var fullSnapshot = new Dictionary<string, int>();
+            foreach (var spot in AllSpots)
+            {
+                fullSnapshot[spot] = 0;
+            }
 
             foreach (var spot in selected)
             {
-                var amount = _realStake[spot];
-                if (amount <= 0) amount = _baseStake;
-                chips[spot] = amount;
-                total += amount;
+                var adjustedAmount = selectedAmounts[spot];
+                if (adjustedAmount <= 0) continue;
+
+                if (adjustedAmount > MaxStakePerSpot) capped = true;
+                var finalAmount = Math.Min(MaxStakePerSpot, adjustedAmount);
+                chips[spot] = finalAmount;
+                _chosenThisRound.Add(spot);
+                fullSnapshot[spot] = finalAmount;
+                total += finalAmount;
+            }
+
+            fullSnapshot[zeroSpot] = 0;
+
+            foreach (var kv in fullSnapshot)
+            {
+                _lastLiveBet[kv.Key] = kv.Value;
+            }
+
+            if (chips.Count == 0 || total <= 0)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                Console.WriteLine(" - Combined signals resulted in zero stake. Skipping live bet this round.");
+                Console.ResetColor();
+                _hasPlacedForThisRound = false;
+                return;
             }
 
             _hasPlacedForThisRound = true;
@@ -669,16 +724,18 @@ namespace MarbleRaceWebSocketBot
 
             _sumTotalLive += total;
 
-            var picksList = string.Join(", ", selected);
-            var amtList = string.Join(", ", selected.Select(s => $"{s}={_realStake[s]}"));
+            _monitor?.RecordLiveBet(fullSnapshot, gameId, _currentNumber);
+
+            var picksList = string.Join(", ", chips.Keys);
+            var amtList = string.Join(", ", chips.Select(kv => $"{kv.Key}={kv.Value}"));
 
             await PostDiscordEmbedAsync(
                 title: "Marble — BET",
-                desc: $"**Round:** `{_currentNumber}` (`{gameId}`)\n**Picks:** `{picksList}`\n**Zero:** `{zeroSpot}`",
+                desc: $"**Round:** `{_currentNumber}` (`{gameId}`)\n**Zero:** `{zeroSpot}`",
                 kind: "BET",
                 fields: new[]
                 {
-                    ("Amounts", $"`{amtList}`", false),
+                    ("Amounts", chips.Count > 0 ? $"`{amtList}`" : "`-`", false),
                     ("Total", $"`{total}`", true),
                     ("Balance", _isFirstBalance ? "`-`" : $"`{Math.Round(_currentBalance, 2)}`", true)
                 }
@@ -687,6 +744,22 @@ namespace MarbleRaceWebSocketBot
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($" - BET GameId {gameId} ({_currentNumber}) → Picks: {picksList} | Zero: {zeroSpot} | Total={total}");
             Console.ResetColor();
+
+            if (capped)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkRed;
+                Console.WriteLine($"   ⚠️ Some combined signals exceeded MaxStakePerSpot={MaxStakePerSpot}. Amounts capped.");
+                Console.ResetColor();
+            }
+        }
+
+        private static string FormatStakeSnapshot(IReadOnlyDictionary<string, int> stakes)
+        {
+            return string.Join(", ", AllSpots.Select(spot =>
+            {
+                var amount = stakes.TryGetValue(spot, out var value) ? value : 0;
+                return $"{spot}={amount}";
+            }));
         }
 
         private bool HasWin(List<string> winningSpots, HashSet<string> chosen)
@@ -704,45 +777,469 @@ namespace MarbleRaceWebSocketBot
         {
             private readonly string[] _allSpots;
             private readonly int _offset;
+            private readonly int _baseStake;
+            private readonly int _maxStake;
+            private readonly double _escalateFactor;
 
             private int _roundCounter;
+            private readonly Dictionary<string, int> _currentProposedStakes = new();
 
-            public SimulationTracker(string name, string[] allSpots, int offset)
+            public SimulationTracker(string name, string[] allSpots, int offset, int baseStake, int maxStake, double escalateFactor)
             {
                 Name = name;
                 _allSpots = allSpots;
                 _offset = offset;
+                _baseStake = baseStake;
+                _maxStake = maxStake;
+                _escalateFactor = escalateFactor;
                 CurrentPicks = new HashSet<string>();
+                CurrentStakePerSpot = _baseStake;
             }
 
             public string Name { get; }
             public HashSet<string> CurrentPicks { get; private set; }
+            public IReadOnlyDictionary<string, int> CurrentProposedStakes => _currentProposedStakes;
             public string ZeroSpot { get; private set; } = string.Empty;
             public int ConsecutiveLosses { get; private set; }
             public int TotalStakeThisRound { get; private set; }
+            public int CurrentStakePerSpot { get; private set; }
             public bool SignalActive => ConsecutiveLosses >= 2;
-
-            public void PrepareRound(int baseStake)
+            public SimulationPredictionSnapshot PrepareRound(string gameId, string roundNumber)
             {
                 _roundCounter++;
                 var zeroIndex = (_roundCounter + _offset) % _allSpots.Length;
                 ZeroSpot = _allSpots[zeroIndex];
                 CurrentPicks = new HashSet<string>(_allSpots.Where(s => s != ZeroSpot));
-                TotalStakeThisRound = CurrentPicks.Count * baseStake;
+                _currentProposedStakes.Clear();
+                foreach (var spot in CurrentPicks)
+                {
+                    _currentProposedStakes[spot] = CurrentStakePerSpot;
+                }
+                TotalStakeThisRound = _currentProposedStakes.Values.Sum();
+
+                var snapshot = new SimulationPredictionSnapshot(
+                    Name,
+                    gameId,
+                    roundNumber,
+                    ZeroSpot,
+                    new Dictionary<string, int>(_currentProposedStakes),
+                    CurrentPicks.ToArray(),
+                    CurrentStakePerSpot,
+                    DateTime.UtcNow);
+
+                LastSnapshot = snapshot;
+                return snapshot;
             }
 
             public bool ProcessResult(IEnumerable<string> winningSpots)
             {
                 var win = winningSpots.Any(CurrentPicks.Contains);
-                ConsecutiveLosses = win ? 0 : ConsecutiveLosses + 1;
+                if (win)
+                {
+                    ConsecutiveLosses = 0;
+                    CurrentStakePerSpot = _baseStake;
+                }
+                else
+                {
+                    ConsecutiveLosses++;
+                    var escalated = (int)Math.Ceiling(CurrentStakePerSpot * _escalateFactor);
+                    CurrentStakePerSpot = Math.Min(_maxStake, Math.Max(_baseStake, escalated));
+                }
+
                 return win;
             }
 
-            public void ResetAfterLiveWin()
+            public void ResetToBase()
             {
                 ConsecutiveLosses = 0;
+                CurrentStakePerSpot = _baseStake;
+            }
+
+            public SimulationPredictionSnapshot? LastSnapshot { get; private set; }
+        }
+    }
+
+    public record SimulationPredictionSnapshot(
+        string Simulation,
+        string GameId,
+        string RoundNumber,
+        string ZeroSpot,
+        IReadOnlyDictionary<string, int> Stakes,
+        IReadOnlyCollection<string> Picks,
+        int StakePerSpot,
+        DateTime TimestampUtc);
+
+    public record LiveBetSnapshot(
+        string GameId,
+        string RoundNumber,
+        DateTime TimestampUtc,
+        IReadOnlyDictionary<string, int> Amounts);
+
+    public class WebMonitor
+    {
+        private readonly string[] _spots;
+        private readonly int _historyLimit;
+        private readonly int _port;
+        private readonly Dictionary<string, LimitedQueue<SimulationPredictionSnapshot>> _history = new();
+        private readonly object _sync = new();
+        private readonly JsonSerializerOptions _jsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        private LiveBetSnapshot? _lastLiveBet;
+        private HttpListener? _listener;
+        private bool _started;
+
+        public WebMonitor(string[] spots, int historyLimit = 20, int port = 8080)
+        {
+            _spots = spots;
+            _historyLimit = historyLimit;
+            _port = port;
+        }
+
+        public void RegisterSimulation(string simulation)
+        {
+            lock (_sync)
+            {
+                if (!_history.ContainsKey(simulation))
+                {
+                    _history[simulation] = new LimitedQueue<SimulationPredictionSnapshot>(_historyLimit);
+                }
             }
         }
+
+        public void RecordPrediction(SimulationPredictionSnapshot snapshot)
+        {
+            lock (_sync)
+            {
+                if (!_history.TryGetValue(snapshot.Simulation, out var queue))
+                {
+                    queue = new LimitedQueue<SimulationPredictionSnapshot>(_historyLimit);
+                    _history[snapshot.Simulation] = queue;
+                }
+
+                queue.Enqueue(snapshot);
+            }
+        }
+
+        public void RecordLiveBet(IReadOnlyDictionary<string, int> amounts, string gameId, string? roundNumber)
+        {
+            lock (_sync)
+            {
+                var copy = amounts.ToDictionary(kv => kv.Key, kv => kv.Value);
+                _lastLiveBet = new LiveBetSnapshot(gameId, roundNumber ?? string.Empty, DateTime.UtcNow, copy);
+            }
+        }
+
+        public Task StartAsync(CancellationToken ct)
+        {
+            lock (_sync)
+            {
+                if (_started) return Task.CompletedTask;
+                _started = true;
+            }
+
+            try
+            {
+                _listener = new HttpListener();
+                _listener.Prefixes.Add($"http://*:{_port}/");
+                _listener.Start();
+            }
+            catch (HttpListenerException ex)
+            {
+                lock (_sync)
+                {
+                    _started = false;
+                }
+
+                Console.ForegroundColor = ConsoleColor.DarkRed;
+                Console.WriteLine($"Web monitor failed to start: {ex.Message}");
+                Console.ResetColor();
+                return Task.CompletedTask;
+            }
+
+            Console.ForegroundColor = ConsoleColor.DarkCyan;
+            Console.WriteLine($"🌐 Web monitor available at http://localhost:{_port}/");
+            Console.ResetColor();
+
+            ct.Register(() =>
+            {
+                try
+                {
+                    _listener?.Stop();
+                }
+                catch
+                {
+                    // ignored
+                }
+            });
+
+            return Task.Run(() => ListenLoopAsync(ct), ct);
+        }
+
+        private async Task ListenLoopAsync(CancellationToken ct)
+        {
+            if (_listener == null) return;
+
+            while (!ct.IsCancellationRequested)
+            {
+                HttpListenerContext? context;
+                try
+                {
+                    context = await _listener.GetContextAsync();
+                }
+                catch (HttpListenerException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+
+                _ = Task.Run(() => HandleContextAsync(context), ct);
+            }
+        }
+
+        private async Task HandleContextAsync(HttpListenerContext context)
+        {
+            try
+            {
+                var path = context.Request.Url?.AbsolutePath ?? "/";
+                if (string.IsNullOrWhiteSpace(path)) path = "/";
+                if (path != "/") path = path.TrimEnd('/');
+
+                switch (path)
+                {
+                    case "/":
+                        await WriteHtmlAsync(context.Response);
+                        break;
+                    case "/data":
+                        await WriteJsonAsync(context.Response);
+                        break;
+                    default:
+                        context.Response.StatusCode = 404;
+                        context.Response.Close();
+                        break;
+                }
+            }
+            catch
+            {
+                try
+                {
+                    context.Response.StatusCode = 500;
+                    context.Response.Close();
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+        }
+
+        private async Task WriteHtmlAsync(HttpListenerResponse response)
+        {
+            const string html = @"<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"utf-8\" />
+    <title>Marble Race Monitor</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #0c1320; color: #f0f3ff; margin: 0; padding: 24px; }
+        h1, h2 { margin-top: 0; }
+        a { color: #5ad1ff; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 24px; }
+        th, td { border: 1px solid #1f2a3d; padding: 6px 8px; font-size: 13px; vertical-align: top; }
+        th { background: #142033; }
+        .grid { display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 12px; max-width: 540px; }
+        .square { background: #182844; border-radius: 10px; padding: 12px; box-shadow: 0 0 8px rgba(0,0,0,0.35); }
+        .square .label { font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: #9cb3d1; }
+        .square .value { font-size: 26px; font-weight: 600; margin-top: 6px; }
+        .timestamp { color: #9cb3d1; font-size: 12px; }
+        .entries { margin-bottom: 18px; }
+        code { background: rgba(255,255,255,0.08); padding: 2px 4px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Marble Race Monitor</h1>
+    <p class=\"timestamp\">Auto-refreshing every 2 seconds.</p>
+
+    <section>
+        <h2>Last Live Bet</h2>
+        <div id=\"bet-grid\" class=\"grid\"></div>
+        <p id=\"bet-meta\" class=\"timestamp\"></p>
+    </section>
+
+    <section>
+        <h2>Simulation Predictions (last 20)</h2>
+        <div id=\"predictions\"></div>
+    </section>
+
+    <script>
+        async function loadData() {
+            try {
+                const res = await fetch('/data');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                renderBet(data);
+                renderPredictions(data);
+            } catch (err) {
+                console.error('Failed to load data', err);
+            }
+        }
+
+        function renderBet(data) {
+            const container = document.getElementById('bet-grid');
+            container.innerHTML = '';
+            const meta = document.getElementById('bet-meta');
+            meta.textContent = '';
+
+            if (!data.lastLiveBet) {
+                container.innerHTML = '<p>No live bet recorded yet.</p>';
+                return;
+            }
+
+            data.order.forEach(spot => {
+                const amount = data.lastLiveBet.amounts[spot] ?? 0;
+                const div = document.createElement('div');
+                div.className = 'square';
+                div.innerHTML = `<div class="label">${spot}</div><div class="value">${amount.toLocaleString()}</div>`;
+                container.appendChild(div);
+            });
+
+            const when = new Date(data.lastLiveBet.timestampUtc).toLocaleString();
+            meta.textContent = `Round ${data.lastLiveBet.roundNumber || '-'} • Game ${data.lastLiveBet.gameId || '-'} • Updated ${when}`;
+        }
+
+        function renderPredictions(data) {
+            const host = document.getElementById('predictions');
+            host.innerHTML = '';
+
+            data.predictions.forEach(sim => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'entries';
+                const title = document.createElement('h3');
+                title.textContent = sim.simulation;
+                wrapper.appendChild(title);
+
+                if (!sim.entries.length) {
+                    const empty = document.createElement('p');
+                    empty.textContent = 'No predictions yet.';
+                    wrapper.appendChild(empty);
+                } else {
+                    const table = document.createElement('table');
+                    const thead = document.createElement('thead');
+                    thead.innerHTML = '<tr><th>When</th><th>Round</th><th>Zero</th><th>Stake/spot</th><th>Picks</th></tr>';
+                    table.appendChild(thead);
+                    const tbody = document.createElement('tbody');
+
+                    sim.entries.forEach(entry => {
+                        const row = document.createElement('tr');
+                        const when = new Date(entry.timestampUtc).toLocaleTimeString();
+                        row.innerHTML = `<td>${when}</td><td>${entry.roundNumber || '-'}</td><td>${entry.zeroSpot}</td><td>${entry.stakePerSpot.toLocaleString()}</td><td><code>${entry.picks.join(', ')}</code></td>`;
+                        tbody.appendChild(row);
+                    });
+
+                    table.appendChild(tbody);
+                    wrapper.appendChild(table);
+                }
+
+                host.appendChild(wrapper);
+            });
+        }
+
+        loadData();
+        setInterval(loadData, 2000);
+    </script>
+</body>
+</html>";
+
+            response.ContentType = "text/html; charset=utf-8";
+            var buffer = Encoding.UTF8.GetBytes(html);
+            response.ContentLength64 = buffer.Length;
+            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            response.Close();
+        }
+
+        private async Task WriteJsonAsync(HttpListenerResponse response)
+        {
+            var snapshot = CreateSnapshot();
+            var json = JsonSerializer.Serialize(snapshot, _jsonOptions);
+
+            response.ContentType = "application/json; charset=utf-8";
+            var buffer = Encoding.UTF8.GetBytes(json);
+            response.ContentLength64 = buffer.Length;
+            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            response.Close();
+        }
+
+        private object CreateSnapshot()
+        {
+            lock (_sync)
+            {
+                var predictions = _history
+                    .OrderBy(kv => kv.Key)
+                    .Select(kv => new
+                    {
+                        simulation = kv.Key,
+                        entries = kv.Value.ToArray()
+                            .OrderByDescending(entry => entry.TimestampUtc)
+                            .Take(_historyLimit)
+                            .Select(entry => new
+                            {
+                                entry.GameId,
+                                entry.RoundNumber,
+                                entry.ZeroSpot,
+                                entry.StakePerSpot,
+                                entry.TimestampUtc,
+                                entry.Picks,
+                                entry.Stakes
+                            })
+                    });
+
+                object? liveBet = null;
+                if (_lastLiveBet != null)
+                {
+                    liveBet = new
+                    {
+                        _lastLiveBet.GameId,
+                        _lastLiveBet.RoundNumber,
+                        _lastLiveBet.TimestampUtc,
+                        _lastLiveBet.Amounts
+                    };
+                }
+
+                return new
+                {
+                    generatedAt = DateTime.UtcNow,
+                    order = _spots,
+                    predictions,
+                    lastLiveBet = liveBet
+                };
+            }
+        }
+    }
+
+    internal class LimitedQueue<T>
+    {
+        private readonly Queue<T> _queue;
+        private readonly int _capacity;
+
+        public LimitedQueue(int capacity)
+        {
+            _capacity = Math.Max(1, capacity);
+            _queue = new Queue<T>(_capacity);
+        }
+
+        public void Enqueue(T item)
+        {
+            if (_queue.Count == _capacity)
+            {
+                _queue.Dequeue();
+            }
+
+            _queue.Enqueue(item);
+        }
+
+        public T[] ToArray() => _queue.ToArray();
     }
 
     internal class Program
@@ -782,9 +1279,12 @@ namespace MarbleRaceWebSocketBot
             var wss = Console.ReadLine();
 
             var baseStake = PromptBaseStake();
-            var client = new MarbleRaceClient(baseStake, webhook);
 
             using var cts = new CancellationTokenSource();
+            var monitor = new WebMonitor(MarbleRaceClient.AllSpots);
+            _ = monitor.StartAsync(cts.Token);
+
+            var client = new MarbleRaceClient(baseStake, webhook, monitor);
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
             await client.RunAsync(wss!, cts.Token);
